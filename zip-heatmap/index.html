@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>65+ Heat Map (2,000+ only)</title>
+  <!-- Leaflet -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <!-- Leaflet.heat plugin -->
+  <script src="https://unpkg.com/leaflet.heat/dist/leaflet-heat.js"></script>
+  <!-- PapaParse (CSV) -->
+  <script src="https://unpkg.com/papaparse@5.4.1/papaparse.min.js"></script>
+  <!-- Turf (for GeoJSON polygon centroids, if needed) -->
+  <script src="https://unpkg.com/@turf/turf@6.5.0/turf.min.js"></script>
+  <style>
+    html, body { height: 100%; margin: 0; }
+    #map { height: 100%; width: 100%; }
+    .control-wrap { position: absolute; top: 10px; left: 10px; z-index: 1000; background: rgba(255,255,255,0.9); padding: 10px 12px; border-radius: 10px; box-shadow: 0 4px 12px rgba(0,0,0,.1); font-family: system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Noto Sans", "Apple Color Emoji", "Segoe UI Emoji"; }
+    .control-wrap label { display:block; font-weight: 600; margin-bottom: 6px; }
+    .note { font-size: 12px; color: #333; margin-top: 6px; }
+    .legend { position: absolute; bottom: 20px; right: 10px; background: rgba(255,255,255,0.9); padding: 10px 12px; border-radius: 10px; box-shadow: 0 4px 12px rgba(0,0,0,.1); font-size: 12px; }
+    .pill { display:inline-block; padding: 2px 8px; border-radius: 999px; background:#f0f0f0; font-size: 12px; margin-left: 6px; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div class="control-wrap">
+    <label>Showing only ZIPs/areas with <strong>65+ pop ≥ <span id="thresholdVal">2,000</span></strong> <span class="pill" id="countPill">0 shown</span></label>
+    <div class="note">Adjust <code>THRESHOLD</code> or data source URL in the code. Long/lat readouts are not displayed anywhere on the UI.</div>
+  </div>
+  <div class="legend">
+    <div><strong>Legend</strong></div>
+    <div>Heat intensity ∝ 65+ population</div>
+  </div>
+
+  <script>
+    // ======= CONFIG =======
+    // Set to either 'csv' OR 'geojson' depending on your data.
+    const DATA_MODE = 'geojson'; // 'csv' or 'geojson'
+
+    // URL to your data file:
+    // CSV must include columns: lat,lng,(and a 65+ column like pop65plus)
+    // GEOJSON can be Point features OR Polygons with a 65+ field in properties.
+    // If polygons, we'll use turf.centroid to place heat points.
+    const DATA_URL = 'data/zcta.geojson'; // e.g. 'data/points.csv' or 'data/zcta.geojson'
+
+    // Name(s) of the 65+ population field(s) to try in your data.
+    const CANDIDATE_65_FIELDS = ['pop65plus', 'population65plus', 'age65plus', 'age_65_plus', 'senior65plus', 'senior_65', 'senior_65_plus', 'pop_65'];
+
+    // Threshold for filtering (keep >= THRESHOLD)
+    const THRESHOLD = 2000;
+
+    // Optional: property names to build a label (town/ZIP name)
+    const NAME_FIELDS = ['name', 'city', 'place_name', 'town', 'zip', 'zcta', 'GEOID', 'ZCTA5'];
+
+    // Heat style
+    const HEAT_OPTIONS = { radius: 22, blur: 18, maxZoom: 10 };
+
+    // ======= MAP INIT =======
+    const map = L.map('map', {
+      zoomControl: true,
+      attributionControl: true
+    });
+
+    // Fit to Eastern US by default
+    map.setView([37.8, -96], 4);
+
+    const basemap = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 18,
+      attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(map);
+
+    // Hidden feature group to help fit bounds after load
+    const markersGroup = L.featureGroup().addTo(map);
+
+    // Simple label layer (no lat/lng shown to the user)
+    const labelLayer = L.layerGroup().addTo(map);
+
+    // Update UI threshold text
+    document.getElementById('thresholdVal').textContent = THRESHOLD.toLocaleString();
+
+    // ======= HELPERS =======
+    function getFirstProperty(obj, fieldList) {
+      if (!obj) return undefined;
+      for (const key of fieldList) {
+        if (obj[key] !== undefined && obj[key] !== null && obj[key] !== '') return obj[key];
+        // try case-insensitive match
+        const ci = Object.keys(obj).find(k => k.toLowerCase() === key.toLowerCase());
+        if (ci && obj[ci] !== undefined && obj[ci] !== null && obj[ci] !== '') return obj[ci];
+      }
+      return undefined;
+    }
+
+    function toNumber(x) {
+      if (x === undefined || x === null || x === '') return NaN;
+      const n = Number(String(x).replace(/[^0-9.-]/g, ''));
+      return isNaN(n) ? NaN : n;
+    }
+
+    function makeLabel(nameVal, zipVal, pop65) {
+      const name = nameVal || '';
+      const zip = zipVal || '';
+      const parts = [];
+      if (name) parts.push(String(name));
+      if (zip) parts.push(String(zip));
+      parts.push(`65+ Pop: ${Number(pop65).toLocaleString()}`);
+      return parts.join(' · ');
+    }
+
+    function addLabeledMarker(lat, lng, label) {
+      const m = L.circleMarker([lat, lng], { radius: 3, weight: 0, opacity: 0 }).addTo(markersGroup);
+      const divIcon = L.divIcon({ className: 'town-label', html: `<div style="background:rgba(255,255,255,.85); padding:2px 6px; border-radius:8px; font-size:12px; box-shadow:0 1px 3px rgba(0,0,0,.2);">${label}</div>`});
+      L.marker([lat, lng], { icon: divIcon }).addTo(labelLayer);
+      return m;
+    }
+
+    // ======= LOADERS =======
+    if (DATA_MODE === 'csv') {
+      Papa.parse(DATA_URL, {
+        download: true,
+        header: true,
+        dynamicTyping: false,
+        complete: results => {
+          const rows = results.data || [];
+          const heat = [];
+          let shown = 0;
+
+          rows.forEach(row => {
+            const lat = toNumber(row.lat || row.latitude || row.Latitude);
+            const lng = toNumber(row.lng || row.lon || row.longitude || row.Longitude);
+            const pop65 = toNumber(getFirstProperty(row, CANDIDATE_65_FIELDS));
+            if (!isFinite(lat) || !isFinite(lng) || !isFinite(pop65)) return;
+            if (pop65 >= THRESHOLD) {
+              heat.push([lat, lng, pop65]);
+              const name = getFirstProperty(row, NAME_FIELDS);
+              const zip = row.zip || row.ZIP || row.ZCTA || row.ZCTA5;
+              addLabeledMarker(lat, lng, makeLabel(name, zip, pop65));
+              shown++;
+            }
+          });
+
+          if (heat.length) {
+            L.heatLayer(heat, HEAT_OPTIONS).addTo(map);
+            map.fitBounds(markersGroup.getBounds().pad(0.2));
+          }
+          document.getElementById('countPill').textContent = `${shown.toLocaleString()} shown`;
+        }
+      });
+    } else if (DATA_MODE === 'geojson') {
+      fetch(DATA_URL).then(r => r.json()).then(geo => {
+        const heat = [];
+        let shown = 0;
+
+        (geo.features || []).forEach(f => {
+          const props = f.properties || {};
+          const pop65 = toNumber(getFirstProperty(props, CANDIDATE_65_FIELDS));
+          if (!isFinite(pop65) || pop65 < THRESHOLD) return;
+
+          let lat, lng;
+          if (f.geometry && f.geometry.type === 'Point') {
+            const c = f.geometry.coordinates; // [lng, lat]
+            if (Array.isArray(c) && isFinite(c[0]) && isFinite(c[1])) { lng = c[0]; lat = c[1]; }
+          } else {
+            try {
+              const centroid = turf.centroid(f);
+              const c = centroid.geometry && centroid.geometry.coordinates;
+              if (Array.isArray(c) && isFinite(c[0]) && isFinite(c[1])) { lng = c[0]; lat = c[1]; }
+            } catch (e) { /* ignore */ }
+          }
+          if (!isFinite(lat) || !isFinite(lng)) return;
+
+          heat.push([lat, lng, pop65]);
+
+          const name = getFirstProperty(props, NAME_FIELDS);
+          const zip = props.zip || props.ZIP || props.ZCTA || props.ZCTA5 || props.GEOID;
+          addLabeledMarker(lat, lng, makeLabel(name, zip, pop65));
+          shown++;
+        });
+
+        if (heat.length) {
+          L.heatLayer(heat, HEAT_OPTIONS).addTo(map);
+          map.fitBounds(markersGroup.getBounds().pad(0.2));
+        }
+        document.getElementById('countPill').textContent = `${shown.toLocaleString()} shown`;
+      });
+    }
+  </script>
+</body>
+</html>
